@@ -2,6 +2,9 @@ using System;
 using System.IO;
 using System.Text.Json;
 using System.Collections.Generic;
+using Vosk;
+using NAudio.Wave;
+using NAudio.MediaFoundation;
 
 namespace VoiceCommand.CommandDetection
 {
@@ -147,6 +150,51 @@ namespace VoiceCommand.CommandDetection
             {
             }
             return Array.Empty<string>();
+        }
+
+        // Transcribe a WAV file using Vosk model located in modelDir (path to model folder).
+        // Returns recognized text (joined words) or empty string.
+        public static string TranscribeFile(string modelDir, string wavPath)
+        {
+            if (!System.IO.File.Exists(wavPath)) throw new System.IO.FileNotFoundException("Audio file not found", wavPath);
+            using var model = new Model(modelDir);
+            using var recognizer = new VoskRecognizer(model, 16000.0f);
+
+            using var reader = new NAudio.Wave.WaveFileReader(wavPath);
+            // Ensure we have 16kHz mono 16-bit PCM bytes via sample providers
+            NAudio.Wave.IWaveProvider waveProvider;
+            if (reader.WaveFormat.SampleRate == 16000 && reader.WaveFormat.Channels == 1 && reader.WaveFormat.BitsPerSample == 16)
+            {
+                waveProvider = reader;
+            }
+            else
+            {
+                var outFmt = new WaveFormat(16000, 16, 1);
+                var conv = new WaveFormatConversionStream(outFmt, reader);
+                waveProvider = conv;
+            }
+
+            var buffer = new byte[4096];
+            int read;
+            string lastJson = null;
+            while ((read = waveProvider.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                if (recognizer.AcceptWaveform(buffer, read))
+                {
+                    lastJson = recognizer.Result();
+                }
+            }
+
+            try
+            {
+                var final = recognizer.FinalResult();
+                if (!string.IsNullOrWhiteSpace(final)) lastJson = final;
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(lastJson)) return string.Empty;
+            var words = ExtractWordsFromResult(lastJson);
+            return string.Join(' ', words);
         }
     }
 }

@@ -1,8 +1,4 @@
-﻿using System;
-using System.IO;
-using System.Text.Json;
-using System.Threading;
-using NAudio.Wave;
+﻿using NAudio.Wave;
 using Vosk;
 using VoiceCommand.CommandDetection;
 
@@ -118,6 +114,37 @@ class Program
             // create shared instances and assign to class fields so we can synchronize disposal
             _modelInstance = new Model(modelPath);
             _recognizerInstance = new VoskRecognizer(_modelInstance, 16000.0f);
+        }
+
+        // If Whisper backend and input mode is mic -> start Whisper real-time transcription
+        if (backend == VoiceCommand.CommandDetection.DetectorBackend.Whisper && inputMode.Equals("mic", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Starting Whisper realtime transcription...");
+            // Callback invoked per chunk; detect canonical commands and print
+            VoiceCommand.CommandDetection.CommandDetectorWhisper.StartRealtimeTranscription(modelPath, (text) =>
+            {
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(text)) return;
+                    Console.WriteLine($"[Whisper chunk] {text}");
+                    var cmd = DetectCommand(text, Commands);
+                    if (cmd != null) Console.WriteLine(cmd);
+                }
+                catch { }
+            });
+
+            Console.WriteLine("Dinleniyor (Whisper realtime). Kapatmak için Ctrl+C basın.");
+            Console.CancelKeyPress += (s, e) =>
+            {
+                e.Cancel = true;
+                Console.WriteLine("Stopping...");
+                VoiceCommand.CommandDetection.CommandDetectorWhisper.StopRealtimeTranscription();
+                StopEvent.Set();
+            };
+
+            StopEvent.Reset();
+            StopEvent.Wait();
+            return;
         }
 
         // No grammar -> recognize free-form (all detected words)
