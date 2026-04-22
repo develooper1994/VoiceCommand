@@ -40,6 +40,9 @@ class Program
         var backendSpecified = false;
         var modelUrlSpecified = false;
         var modelSizeSpecified = false;
+        string? whisperNativePath = null;
+        var whisperAccel = "auto"; // values: auto, cpu, cuda, vulkan
+        var whisperAccelSpecified = false;
 
         if (args == null || args.Length == 0)
         {
@@ -114,6 +117,15 @@ class Program
                 else if (a.Equals("--model-dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 {
                     modelDirOverride = args[++i];
+                }
+                else if (a.Equals("--whisper-native-path", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    whisperNativePath = args[++i];
+                }
+                else if (a.Equals("--whisper-accel", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    whisperAccel = args[++i];
+                    whisperAccelSpecified = true;
                 }
                 else if (a.Equals("--list-models", StringComparison.OrdinalIgnoreCase))
                 {
@@ -259,6 +271,44 @@ class Program
         return null;
     }
 
+    // Auto-detect available GPU accel libraries (CUDA / Vulkan) on the host.
+    static string? AutoDetectWhisperAccel()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                if (TryLoadNativeLibrary("nvcuda.dll")) return "cuda";
+                if (TryLoadNativeLibrary("vulkan-1.dll")) return "vulkan";
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                if (TryLoadNativeLibrary("libcuda.so.1") || TryLoadNativeLibrary("libcuda.so")) return "cuda";
+                if (TryLoadNativeLibrary("libvulkan.so.1") || TryLoadNativeLibrary("libvulkan.so")) return "vulkan";
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                if (TryLoadNativeLibrary("libvulkan.1.dylib") || TryLoadNativeLibrary("libvulkan.dylib")) return "vulkan";
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    static bool TryLoadNativeLibrary(string name)
+    {
+        try
+        {
+            if (NativeLibrary.TryLoad(name, out var handle))
+            {
+                try { NativeLibrary.Free(handle); } catch { }
+                return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
         // Run command (detect/full) is handled after ensuring models are available.
 
         // model directory is organized per-backend: model/vosk and model/whisper
@@ -354,6 +404,63 @@ class Program
         {
             Console.WriteLine("Model missing or absent: automatic install will be attempted because a run command was specified.");
         }
+        // If the user provided a custom native runtime path for Whisper (e.g., GPU-enabled whisper.cpp builds),
+        // prepend it to PATH so native loader can find the GPU-enabled native libraries before the default ones.
+        if (!string.IsNullOrEmpty(whisperNativePath))
+        {
+            try
+            {
+                var abs = Path.GetFullPath(whisperNativePath);
+                if (Directory.Exists(abs))
+                {
+                    var old = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+                    var sep = Path.PathSeparator;
+                    Environment.SetEnvironmentVariable("PATH", abs + sep + old);
+                    Console.WriteLine($"Added '{abs}' to PATH for native Whisper libraries.");
+                }
+                else
+                {
+                    Console.WriteLine($"Whisper native path not found: {abs}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to adjust PATH for native Whisper libs: {ex.Message}");
+            }
+        }
+
+        // If user requested an acceleration backend (e.g., 'cuda' or 'vulkan'), expose it as an environment variable
+        // so native runtimes or helper scripts can pick it up. This is advisory; user must install/compile GPU-enabled native libs.
+        try
+        {
+            // If user didn't explicitly pick accel (or used 'auto'), try to detect installed GPU runtimes
+            if (!whisperAccelSpecified || whisperAccel.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var detected = AutoDetectWhisperAccel();
+                    if (!string.IsNullOrEmpty(detected))
+                    {
+                        whisperAccel = detected;
+                        Console.WriteLine($"Auto-detected Whisper acceleration: {whisperAccel}");
+                    }
+                    else
+                    {
+                        whisperAccel = "cpu";
+                        Console.WriteLine("No GPU acceleration detected; falling back to CPU (ggml).");
+                    }
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrEmpty(whisperAccel) && !whisperAccel.Equals("cpu", StringComparison.OrdinalIgnoreCase) && !whisperAccel.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            {
+                Environment.SetEnvironmentVariable("WHISPER_ACCEL", whisperAccel);
+                Console.WriteLine($"Requested Whisper acceleration: {whisperAccel} (set WHISPER_ACCEL env var).\nIf you want GPU support, ensure you have a GPU-enabled whisper.cpp native build and place its DLLs in a folder and pass --whisper-native-path <path>.");
+            }
+        }
+        catch { }
+
         var ensured = await VoiceCommand.Model.ModelInstaller.EnsureModelAsync(backend, modelPath, shouldAutoInstall, modelUrl, forceInstall);
         if (!ensured)
         {

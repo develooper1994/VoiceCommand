@@ -144,6 +144,8 @@ namespace VoiceCommand.CommandDetection
         private static readonly object _bufferLock = new object();
         private static int _bytesPerChunk = 16000 * 2; // default 1s worth (will be overwritten)
         private static bool _realtimeRunning = false;
+        // Semaphore to limit concurrent chunk processing to avoid excessive native memory/CPU pressure
+        private static System.Threading.SemaphoreSlim? _processingSemaphore = null;
             // Whether we've already reported a native runtime/library problem to avoid spamming
             private static bool _nativeRuntimeProblemReported = false;
 
@@ -196,14 +198,57 @@ namespace VoiceCommand.CommandDetection
             // Helper: create or return a cached WhisperFactory for the provided model path.
             private static Whisper.net.WhisperFactory GetOrCreateFactory(string modelPath)
             {
-                lock (_factoryLock)
-                {
-                    if (_cachedFactory != null) return _cachedFactory;
-                    var start = DateTime.UtcNow;
-                    _cachedFactory = Whisper.net.WhisperFactory.FromPath(modelPath);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Whisper factory created and cached (took {(DateTime.UtcNow - start).TotalSeconds:F2}s)");
-                    return _cachedFactory;
-                }
+                        lock (_factoryLock)
+                        {
+                            if (_cachedFactory != null) return _cachedFactory;
+                            var start = DateTime.UtcNow;
+                            try
+                            {
+                                var fi = new FileInfo(modelPath);
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Creating Whisper factory from: {modelPath} ({fi.Length} bytes)");
+                                try
+                                {
+                                    Console.WriteLine($"  Process is 64-bit: {Environment.Is64BitProcess}");
+                                }
+                                catch { }
+                                try
+                                {
+                                    Console.WriteLine($"  Process private memory: {Process.GetCurrentProcess().PrivateMemorySize64} bytes");
+                                }
+                                catch { }
+                                try
+                                {
+                                    Console.WriteLine($"  GC total available memory (approx): {GC.GetGCMemoryInfo().TotalAvailableMemoryBytes} bytes");
+                                }
+                                catch { }
+
+                                _cachedFactory = Whisper.net.WhisperFactory.FromPath(modelPath);
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Whisper factory created and cached (took {(DateTime.UtcNow - start).TotalSeconds:F2}s)");
+                                return _cachedFactory;
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Whisper factory creation failed: {ex.Message}");
+                                // Attempt a fallback: copy the model to a short temp path and retry, which can
+                                // avoid issues with long paths, locking, or platform-specific mmap problems.
+                                try
+                                {
+                                    var tmpName = Path.GetFileName(modelPath);
+                                    var tmpPath = Path.Combine(Path.GetTempPath(), tmpName);
+                                    Console.WriteLine($"Attempting fallback: copy model to temp path {tmpPath} and retry...");
+                                    File.Copy(modelPath, tmpPath, true);
+                                    var start2 = DateTime.UtcNow;
+                                    _cachedFactory = Whisper.net.WhisperFactory.FromPath(tmpPath);
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Whisper factory created from temp and cached (took {(DateTime.UtcNow - start2).TotalSeconds:F2}s)");
+                                    return _cachedFactory;
+                                }
+                                catch (Exception ex2)
+                                {
+                                    Console.WriteLine($"Fallback factory creation also failed: {ex2.Message}");
+                                    throw;
+                                }
+                            }
+                        }
             }
 
         // Start real-time (chunked) transcription. onTranscribed is invoked when each chunk is processed.
@@ -213,7 +258,7 @@ namespace VoiceCommand.CommandDetection
 
             // quick validation to avoid starting realtime when the model is missing
             // or appears to be a partial/corrupt download (prevents native ggml asserts)
-            if (!TryGetValidModelPath(modelDir, out var _))
+            if (!TryGetValidModelPath(modelDir, out var validatedModelPath))
             {
                 Console.WriteLine("Aborting realtime transcription due to invalid/absent Whisper model.");
                 return;
@@ -223,6 +268,26 @@ namespace VoiceCommand.CommandDetection
             _bufferRealtime = new MemoryStream();
             // bytes per millisecond = sampleRate * channels * bytesPerSample / 1000 = 16000*1*2/1000 = 32
             _bytesPerChunk = 32 * Math.Max(100, chunkMs);
+
+            // Choose concurrency based on model size: large models are memory/CPU intensive,
+            // prefer single-threaded chunk processing to avoid native allocation races/pressure.
+            try
+            {
+                int concurrency = 2;
+                try
+                {
+                    var fi = new FileInfo(validatedModelPath);
+                    // conservative thresholds
+                    if (fi.Length > 400L * 1024 * 1024) concurrency = 1; // >400MB -> 1
+                    else if (fi.Length > 150L * 1024 * 1024) concurrency = 1; // >150MB -> 1
+                    else concurrency = 2;
+                }
+                catch { concurrency = 1; }
+                try { _processingSemaphore?.Dispose(); } catch { }
+                _processingSemaphore = new System.Threading.SemaphoreSlim(concurrency, concurrency);
+                Console.WriteLine($"Realtime chunk processing concurrency set to {_processingSemaphore.CurrentCount} (max {concurrency})");
+            }
+            catch { }
 
             _waveInRealtime = new WaveInEvent
             {
@@ -258,9 +323,14 @@ namespace VoiceCommand.CommandDetection
                                 w.Write(chunk, 0, chunk.Length);
                             }
 
-                            // process in background
+                            // process in background with concurrency limit to avoid overwhelming native runtime
                             _ = Task.Run(async () =>
                             {
+                                var sem = _processingSemaphore;
+                                if (sem != null)
+                                {
+                                    await sem.WaitAsync().ConfigureAwait(false);
+                                }
                                 try
                                 {
                                     var txt = await TranscribeFileAsync(modelDir, tmp).ConfigureAwait(false);
@@ -273,6 +343,7 @@ namespace VoiceCommand.CommandDetection
                                 finally
                                 {
                                     try { File.Delete(tmp); } catch { }
+                                    try { sem?.Release(); } catch { }
                                 }
                             });
                         }
@@ -304,7 +375,6 @@ namespace VoiceCommand.CommandDetection
                 _bufferRealtime = null;
             }
             _realtimeRunning = false;
-
             // Dispose cached factory after allowing in-flight processors to finish (short timeout).
             lock (_factoryLock)
             {
@@ -319,6 +389,10 @@ namespace VoiceCommand.CommandDetection
                     _cachedFactory = null;
                 }
             }
+
+            // Dispose processing semaphore
+            try { _processingSemaphore?.Dispose(); } catch { }
+            _processingSemaphore = null;
         }
 
         // Transcribe a WAV file using Whisper.net offline GGML model located in modelDir.

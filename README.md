@@ -29,6 +29,39 @@ Lightweight Türkçe sesli komut algılama örneği. Proje, komut eşleştirme m
     - Otomatik: Uygulama, eksik modelleri indirmek için `--download-models`, `--auto-install` veya `--autoinstall` argümanlarını destekler. Bu işlem büyük dosyalar indirebilir; internet bağlantısı gerektirir.
     - Whisper için model boyutu seçeneği: `--model-size <tiny|base|small|medium|large>` kullanılabilir veya `--model-url <url>` ile doğrudan URL verilebilir.
 
+   - Not: Eğer `--model-size` kullanırsanız uygulama `model/whisper/<size>/` klasörünü arar. Eğer bu klasör boşsa ancak `model/whisper/` altında daha önce indirilmiş bir genel `.bin` dosyası varsa, uygulama bu genel dosyayı otomatik olarak `model/whisper/<size>/ggml-<size>.bin` adıyla kopyayıp kullanmaya çalışır ve bir uyarı gösterir. Bu yalnızca hızlı test için bir kolaylıktır; doğru modeli garanti etmek için `--download-models --model-size <size> --force` ile yeniden indirme yapın veya el ile doğru dosyayı `model/whisper/<size>/ggml-<size>.bin` olarak yerleştirin.
+
+   - PowerShell örnek (elle kopyalamak isterseniz):
+
+   ```powershell
+   $src = 'C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin'
+   $dstDir = 'C:\path\to\project\model\whisper\tiny'
+   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+   Copy-Item -Path $src -Destination (Join-Path $dstDir 'ggml-tiny.bin') -Force
+   ```
+
+GPU acceleration (experimental)
+
+The app can attempt to use a GPU-enabled native Whisper runtime (CUDA or Vulkan) if you provide one. This requires building or obtaining a GPU-enabled `whisper.cpp` native library and pointing the app at the folder containing its DLLs.
+
+Usage example:
+
+```powershell
+dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --whisper-native-path "C:\whisper_native_gpu" --whisper-accel cuda
+```
+
+Notes:
+- The `--whisper-native-path` directory is prepended to the process `PATH` so the native loader can find GPU-enabled libraries.
+- The `--whisper-accel` option is advisory (values: `auto`, `cpu`, `cuda`, `vulkan`) and sets `WHISPER_ACCEL` environment variable for native runtimes to pick up.
+- You must ensure appropriate GPU drivers and CUDA/Vulkan runtimes are installed. See `docs/ModelInstall.md` for more details.
+
+   - CMD örnek:
+
+   ```cmd
+   mkdir "C:\path\to\project\model\whisper\tiny" 2>nul
+   copy /Y "C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin" "C:\path\to\project\model\whisper\tiny\ggml-tiny.bin"
+   ```
+
 Çalıştırma ve örnekler:
 
 - Yardım: `dotnet run --project VoiceCommand -- --help`

@@ -48,6 +48,12 @@ Common sources:
    - `model/whisper/ggml-small.bin` or
    - `model/whisper/small/ggml-small.bin`
 
+### Model-size behavior and canonical filenames
+
+The application supports `--model-size <tiny|base|small|medium|large>`. Internally the runtime expects a canonical ggml filename such as `ggml-tiny.bin`, `ggml-base.bin`, etc., located inside a size-specific folder `model/whisper/<size>/`.
+
+If you pass `--model-size` and the corresponding `model/whisper/<size>/` folder is empty but a generic model file exists directly under `model/whisper/` (for example a previously-downloaded `tmp*.bin`), the app will automatically copy that generic model into the size folder and rename it to the canonical filename (e.g. `ggml-tiny.bin`). A warning message is printed when this fallback copy occurs. This is a convenience for quick testing, but it does not guarantee the copied model actually matches the requested size — to ensure correct model files, prefer using the explicit download or manual placement steps below.
+
 2. To avoid native runtime errors, ensure the Whisper native runtime (Whisper.net runtime) is available for your platform. The simplest option for a .NET app is to add the NuGet runtime package:
 
 ```powershell
@@ -76,6 +82,56 @@ Use `--force` to re-download if a downloaded file appears corrupt:
 ```powershell
 dotnet run --project VoiceCommand -- --download-models --model whisper --model-size small --force
 ```
+
+If you previously saw a generic temporary file under `model/whisper/` (e.g. `tmp2zy2ot.tmp.bin`) and want to make it available for a specific size quickly, you can either let the app auto-copy when running with `--model-size`, or manually copy it yourself using the commands below.
+
+Windows PowerShell (example):
+
+```powershell
+$src = 'C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin'
+$dstDir = 'C:\path\to\project\model\whisper\tiny'
+New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+Copy-Item -Path $src -Destination (Join-Path $dstDir 'ggml-tiny.bin') -Force
+Write-Output 'copied'
+```
+
+Windows CMD (example):
+
+```cmd
+mkdir "C:\path\to\project\model\whisper\tiny" 2>nul
+copy /Y "C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin" "C:\path\to\project\model\whisper\tiny\ggml-tiny.bin"
+```
+
+Make sure to adapt paths and filename to your setup. If you need to guarantee the requested model size, re-run the automatic download with `--download-models --model-size <size> --force`.
+
+## GPU acceleration (CUDA / Vulkan)
+
+Whisper/whisper.cpp can be built to use GPU acceleration (CUDA on NVIDIA or Vulkan on supported hardware). The .NET wrapper (`Whisper.net`) loads a native library; to use a GPU-enabled native build you must supply a compatible native runtime.
+
+Steps to enable GPU acceleration:
+
+1. Obtain or build a GPU-enabled whisper.cpp native library for your platform (Windows x64 example):
+  - Build whisper.cpp with CUDA support by following the project's build instructions and enabling CUDA backend. See: https://github.com/ggerganov/whisper.cpp
+  - Alternatively, build with Vulkan/WGPU support if CUDA is not available.
+
+2. Place the resulting native DLLs/shared objects in a folder, e.g. `C:\whisper_native_gpu\`.
+
+3. Run the app with the `--whisper-native-path` option pointing to that folder and request acceleration with `--whisper-accel`:
+
+```powershell
+dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --whisper-native-path "C:\whisper_native_gpu" --whisper-accel cuda
+```
+
+Notes:
+- The application will prepend the provided path to the process `PATH` environment variable before loading Whisper, which allows the native loader to find your GPU-enabled libraries.
+- The `--whisper-accel` flag sets an environment variable `WHISPER_ACCEL` for the process to signal intent; native runtimes or helper scripts may read this to choose GPU code paths.
+- You must ensure CUDA drivers and runtime libraries compatible with your native build are installed on the machine.
+- If GPU-enabled native libraries are not present or incompatible, the app will fall back to CPU/ggml behavior (or fail with a native load error). See troubleshooting below.
+
+Auto-detection:
+
+- If you do not specify `--whisper-accel`, the application will attempt to auto-detect available GPU runtimes by looking for common native loader libraries (e.g., `nvcuda.dll` on Windows or `libcuda.so` / `libvulkan.so` on Linux). If CUDA is present it will prefer `cuda`, otherwise it will try `vulkan`.
+- Auto-detection only verifies presence of the system GPU runtime loader; you still need a GPU-enabled `whisper.cpp` native build (DLLs/so files) to actually perform GPU inference. Use `--whisper-native-path` to point to those native binaries.
 
 ## Troubleshooting
 
