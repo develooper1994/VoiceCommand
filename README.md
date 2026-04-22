@@ -29,6 +29,24 @@ Lightweight Türkçe sesli komut algılama örneği. Proje, komut eşleştirme m
     - Otomatik: Uygulama, eksik modelleri indirmek için `--download-models`, `--auto-install` veya `--autoinstall` argümanlarını destekler. Bu işlem büyük dosyalar indirebilir; internet bağlantısı gerektirir.
     - Whisper için model boyutu seçeneği: `--model-size <tiny|base|small|medium|large>` kullanılabilir veya `--model-url <url>` ile doğrudan URL verilebilir.
 
+   - Not: Eğer `--model-size` kullanırsanız uygulama `model/whisper/<size>/` klasörünü arar. Eğer bu klasör boşsa ancak `model/whisper/` altında daha önce indirilmiş bir genel `.bin` dosyası varsa, uygulama bu genel dosyayı otomatik olarak `model/whisper/<size>/ggml-<size>.bin` adıyla kopyayıp kullanmaya çalışır ve bir uyarı gösterir. Bu yalnızca hızlı test için bir kolaylıktır; doğru modeli garanti etmek için `--download-models --model-size <size> --force` ile yeniden indirme yapın veya el ile doğru dosyayı `model/whisper/<size>/ggml-<size>.bin` olarak yerleştirin.
+
+   - PowerShell örnek (elle kopyalamak isterseniz):
+
+   ```powershell
+   $src = 'C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin'
+   $dstDir = 'C:\path\to\project\model\whisper\tiny'
+   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+   Copy-Item -Path $src -Destination (Join-Path $dstDir 'ggml-tiny.bin') -Force
+   ```
+
+   - CMD örnek:
+
+   ```cmd
+   mkdir "C:\path\to\project\model\whisper\tiny" 2>nul
+   copy /Y "C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin" "C:\path\to\project\model\whisper\tiny\ggml-tiny.bin"
+   ```
+
 Çalıştırma ve örnekler:
 
 - Yardım: `dotnet run --project VoiceCommand -- --help`

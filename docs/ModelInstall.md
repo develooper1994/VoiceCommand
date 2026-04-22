@@ -48,6 +48,12 @@ Common sources:
    - `model/whisper/ggml-small.bin` or
    - `model/whisper/small/ggml-small.bin`
 
+### Model-size behavior and canonical filenames
+
+The application supports `--model-size <tiny|base|small|medium|large>`. Internally the runtime expects a canonical ggml filename such as `ggml-tiny.bin`, `ggml-base.bin`, etc., located inside a size-specific folder `model/whisper/<size>/`.
+
+If you pass `--model-size` and the corresponding `model/whisper/<size>/` folder is empty but a generic model file exists directly under `model/whisper/` (for example a previously-downloaded `tmp*.bin`), the app will automatically copy that generic model into the size folder and rename it to the canonical filename (e.g. `ggml-tiny.bin`). A warning message is printed when this fallback copy occurs. This is a convenience for quick testing, but it does not guarantee the copied model actually matches the requested size — to ensure correct model files, prefer using the explicit download or manual placement steps below.
+
 2. To avoid native runtime errors, ensure the Whisper native runtime (Whisper.net runtime) is available for your platform. The simplest option for a .NET app is to add the NuGet runtime package:
 
 ```powershell
@@ -76,6 +82,27 @@ Use `--force` to re-download if a downloaded file appears corrupt:
 ```powershell
 dotnet run --project VoiceCommand -- --download-models --model whisper --model-size small --force
 ```
+
+If you previously saw a generic temporary file under `model/whisper/` (e.g. `tmp2zy2ot.tmp.bin`) and want to make it available for a specific size quickly, you can either let the app auto-copy when running with `--model-size`, or manually copy it yourself using the commands below.
+
+Windows PowerShell (example):
+
+```powershell
+$src = 'C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin'
+$dstDir = 'C:\path\to\project\model\whisper\tiny'
+New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+Copy-Item -Path $src -Destination (Join-Path $dstDir 'ggml-tiny.bin') -Force
+Write-Output 'copied'
+```
+
+Windows CMD (example):
+
+```cmd
+mkdir "C:\path\to\project\model\whisper\tiny" 2>nul
+copy /Y "C:\path\to\project\model\whisper\tmp2zy2ot.tmp.bin" "C:\path\to\project\model\whisper\tiny\ggml-tiny.bin"
+```
+
+Make sure to adapt paths and filename to your setup. If you need to guarantee the requested model size, re-run the automatic download with `--download-models --model-size <size> --force`.
 
 ## Troubleshooting
 
