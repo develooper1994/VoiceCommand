@@ -2,19 +2,68 @@
 using System.IO;
 using System.Text.Json;
 using System.Threading;
-using System.Globalization;
-
 using NAudio.Wave;
-
 using Vosk;
 
 class Program
 {
     static readonly ManualResetEventSlim StopEvent = new(false);
+    // Shared canonical commands list
+    static readonly string[] Commands = new[] { "başla", "başlat", "kapa", "kapat", "yazdır", "iptal", "yeniden dene", "kart ver", "para yükle", "bakiye kontrol" };
+    // Prevent printing the same command repeatedly
+    static string _lastPrintedCommand = null;
+    static DateTime _lastPrintedTime = DateTime.MinValue;
+    static readonly object _printLock = new();
+    // Minimum milliseconds between repeated prints of the same command
+    const int RepeatSuppressMs = 2000;
+    // Recording shutdown coordination used by modes to avoid native crashes
+    static readonly ManualResetEventSlim _recordingStopped = new(false);
+    static volatile bool _stopping = false;
+    // Recognizer resources and lock for safe P/Invoke access
+    static Model _modelInstance = null;
+    static VoskRecognizer _recognizerInstance = null;
+    static WaveInEvent _waveInInstance = null;
+    static readonly object _recognizerLock = new();
 
     static void Main(string[] args)
     {
         Console.WriteLine("Sesli komut dinleyici başlatılıyor...");
+        // Show possible commands at startup
+        Console.WriteLine("Algılanabilecek komutlar: " + string.Join(", ", Commands));
+        // Print available audio input devices
+        PrintInputDevices();
+
+        // If started with the 'full' argument, run the FullRecognize session and exit.
+        if (args != null && args.Length > 0 && args[0].Equals("full", StringComparison.OrdinalIgnoreCase))
+        {
+            FullRecognize();
+            return;
+        }
+
+    static void PrintInputDevices()
+    {
+        try
+        {
+            Console.WriteLine("Available input devices:");
+            for (int i = 0; i < WaveInEvent.DeviceCount; i++)
+            {
+                var caps = WaveInEvent.GetCapabilities(i);
+                Console.WriteLine($"  {i}: {caps.ProductName}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not enumerate input devices: {ex.Message}");
+        }
+    }
+
+        // If started with the 'detect' argument, run the DetectOnly session that prints only detected commands.
+        if (args != null && args.Length > 0 && args[0].Equals("detect", StringComparison.OrdinalIgnoreCase))
+        {
+            DetectOnly();
+            return;
+        }
+
         var modelPath = Path.Combine(AppContext.BaseDirectory, "model");
         if (!Directory.Exists(modelPath))
         {
@@ -24,41 +73,65 @@ class Program
         }
 
         Vosk.Vosk.SetLogLevel(0);
-        using var model = new Model(modelPath);
+        // create shared instances and assign to class fields so we can synchronize disposal
+        _modelInstance = new Model(modelPath);
+        _recognizerInstance = new VoskRecognizer(_modelInstance, 16000.0f);
 
         // No grammar -> recognize free-form (all detected words)
-        using var recognizer = new VoskRecognizer(model, 16000.0f);
-
-        // Commands to detect (canonical forms)
-        var commands = new[] { "başla", "başlat", "kapa", "kapat", "yazdır", "iptal", "yeniden dene", "kart ver", "para yükle", "bakiye kontrol" };
-
-        var waveIn = new WaveInEvent
+        _waveInInstance = new WaveInEvent
         {
             DeviceNumber = 0,
             WaveFormat = new WaveFormat(16000, 16, 1)
         };
 
-        waveIn.DataAvailable += (s, e) =>
+        // synchronize shutdown to avoid native access violations in Vosk when disposing while callbacks run
+        _recordingStopped.Reset();
+        _stopping = false;
+        _waveInInstance.RecordingStopped += (s, e) => _recordingStopped.Set();
+
+        _waveInInstance.DataAvailable += (s, e) =>
         {
             try
             {
-                // Feed audio to recognizer
-                if (recognizer.AcceptWaveform(e.Buffer, e.BytesRecorded))
+                if (_stopping) return;
+                // Feed audio to recognizer (call under lock to avoid races with disposal)
+                bool accepted;
+                lock (_recognizerLock)
                 {
-                    var resultJson = recognizer.Result();
-                    var text = PrintJsonResult("Final", resultJson);
-                    if (!string.IsNullOrWhiteSpace(text))
+                    if (_stopping || _recognizerInstance == null) return;
+                    accepted = _recognizerInstance.AcceptWaveform(e.Buffer, e.BytesRecorded);
+                }
+
+                if (accepted)
+                {
+                    string resultJson;
+                    lock (_recognizerLock)
                     {
-                        var cmd = DetectCommand(text, commands);
+                        if (_recognizerInstance == null) return;
+                        resultJson = _recognizerInstance.Result();
+                    }
+                    // Extract only final words (ignore partial fallback) and do not print raw recognized text here
+                    var finalWords = ExtractFinalWords(resultJson);
+                    if (finalWords.Length > 0)
+                    {
+                        // Clean tokens (remove middle dot etc.) and normalize
+                        for (int i = 0; i < finalWords.Length; i++) finalWords[i] = CleanToken(finalWords[i]);
+                        var text = string.Join(' ', finalWords).Trim();
+                        var cmd = DetectCommand(text, Commands);
                         if (cmd != null)
                         {
-                            Console.WriteLine($"Detected command: {cmd}");
+                            Console.WriteLine(cmd);
                         }
                     }
                 }
                 else
                 {
-                    var partialJson = recognizer.PartialResult();
+                    string partialJson;
+                    lock (_recognizerLock)
+                    {
+                        if (_recognizerInstance == null) return;
+                        partialJson = _recognizerInstance.PartialResult();
+                    }
                     PrintJsonResult("Partial", partialJson);
                 }
             }
@@ -72,14 +145,130 @@ class Program
         {
             e.Cancel = true;
             Console.WriteLine("Stopping...");
-            waveIn.StopRecording();
+            // initiate safe shutdown sequence
+            _stopping = true;
+            try { _waveInInstance?.StopRecording(); } catch { }
+            // wait for RecordingStopped to ensure no more DataAvailable callbacks
+            _recordingStopped.Wait(2000);
+            lock (_recognizerLock)
+            {
+                try { _recognizerInstance?.Dispose(); } catch { }
+                _recognizerInstance = null;
+                try { _modelInstance?.Dispose(); } catch { }
+                _modelInstance = null;
+            }
             StopEvent.Set();
         };
 
-        waveIn.StartRecording();
+        _waveInInstance.StartRecording();
         Console.WriteLine("Dinleniyor (tüm kelimeler algılanır). Kapatmak için Ctrl+C basın.");
         StopEvent.Wait();
-        waveIn.Dispose();
+        // ensure recording stopped and callbacks finished
+        _stopping = true;
+        try { _waveInInstance?.StopRecording(); } catch { }
+        _recordingStopped.Wait(2000);
+        try { _waveInInstance?.Dispose(); } catch { }
+    }
+
+    // Normalize input for comparison (handle Turkish dotted/dotless I then lowercase invariant)
+    // Clean token: remove punctuation (including interpunct), handle Turkish dotted/dotless I, lowercase invariant
+    static string CleanToken(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+        // Replace Turkish dotted/dotless I explicitly before lowercasing
+        s = s.Replace('\u0130', 'i'); // 'İ' -> 'i'
+        s = s.Replace('I', '\u0131'); // 'I' -> 'ı'
+        // Remove common separator characters like middle dot and any non-letter characters
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (var ch in s)
+        {
+            if (char.IsLetter(ch) || char.IsWhiteSpace(ch)) sb.Append(ch);
+            // treat middle dot as separator (skip)
+            // other punctuation is removed
+        }
+        return sb.ToString().Trim().ToLowerInvariant();
+    }
+
+    static string[] ExtractWordsFromResult(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<string>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // If 'result' array present, extract 'word' entries
+            if (root.TryGetProperty("result", out var resultProp) && resultProp.ValueKind == JsonValueKind.Array && resultProp.GetArrayLength() > 0)
+            {
+                var list = new System.Collections.Generic.List<string>();
+                foreach (var item in resultProp.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("word", out var w))
+                    {
+                        var word = w.GetString();
+                        if (!string.IsNullOrWhiteSpace(word)) list.Add(CleanToken(word));
+                    }
+                }
+                if (list.Count > 0) return list.ToArray();
+            }
+
+            // Fallback to 'text' property if non-empty
+            if (root.TryGetProperty("text", out var textProp))
+            {
+                var t = textProp.GetString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(t))
+                {
+                    var parts = t.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                    for (int i = 0; i < parts.Length; i++) parts[i] = CleanToken(parts[i]);
+                    return parts;
+                }
+            }
+
+            // Partial results
+            if (root.TryGetProperty("partial", out var partialProp))
+            {
+                var p = partialProp.GetString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(p))
+                {
+                    var parts = p.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                    for (int i = 0; i < parts.Length; i++) parts[i] = CleanToken(parts[i]);
+                    return parts; // return partial words but caller should ignore if they want finals only
+                }
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return Array.Empty<string>();
+    }
+
+    // Extract only final word tokens from a final result JSON (ignore empty 'text' finals)
+    static string[] ExtractFinalWords(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<string>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("result", out var resultProp) && resultProp.ValueKind == JsonValueKind.Array && resultProp.GetArrayLength() > 0)
+            {
+                var list = new System.Collections.Generic.List<string>();
+                foreach (var item in resultProp.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("word", out var w))
+                    {
+                        var word = w.GetString();
+                        if (!string.IsNullOrWhiteSpace(word)) list.Add(word);
+                    }
+                }
+                return list.ToArray();
+            }
+        }
+        catch
+        {
+        }
+        return Array.Empty<string>();
     }
 
     static string PrintJsonResult(string kind, string json)
@@ -87,25 +276,11 @@ class Program
         if (string.IsNullOrWhiteSpace(json)) return null;
         Console.WriteLine($"[{kind}] {json}");
 
-        // Try to extract the textual transcription (Vosk returns {"text":"..."}).
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("text", out var text))
-            {
-                var t = text.GetString();
-                if (!string.IsNullOrWhiteSpace(t))
-                {
-                    Console.WriteLine($"Recognized text: {t}");
-                    return t;
-                }
-            }
-        }
-        catch
-        {
-            // ignore parse errors
-        }
-        return null;
+        var words = ExtractWordsFromResult(json);
+        if (words.Length == 0) return null;
+        var text = string.Join(' ', words);
+        Console.WriteLine($"Recognized text: {text}");
+        return text;
     }
 
     // Full free-form recognition in a separate function.
@@ -155,7 +330,8 @@ class Program
 
             Console.WriteLine("Full recognition: listening for all words. Press Ctrl+C to stop.");
             Console.CancelKeyPress += (s, e) =>
-            {
+  
+           {
                 e.Cancel = true;
                 Console.WriteLine("Stopping full recognition...");
                 waveIn.StopRecording();
@@ -170,6 +346,129 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"FullRecognize error: {ex}");
+        }
+    }
+
+    /*
+     *** OUTPUT ***
+    Sesli komut dinleyici başlatılıyor...
+    Algılanabilecek komutlar: başla, başlat, kapa, kapat, yazdır, iptal, yeniden dene, kart ver, para yükle, bakiye kontrol
+    Available input devices:
+      0: Mikrofon (Razer Kraken V3 X)
+    Starting detect-only session (prints only detected commands)...
+    LOG (VoskAPI:ReadDataFiles():model.cc:213) Decoding params beam=13 max-active=7000 lattice-beam=6
+    LOG (VoskAPI:ReadDataFiles():model.cc:216) Silence phones 1:2:3:4:5:6:7:8:9:10
+    LOG (VoskAPI:RemoveOrphanNodes():nnet-nnet.cc:948) Removed 1 orphan nodes.
+    LOG (VoskAPI:RemoveOrphanComponents():nnet-nnet.cc:847) Removing 2 orphan components.
+    LOG (VoskAPI:Collapse():nnet-utils.cc:1488) Added 1 components, removed 2
+    LOG (VoskAPI:ReadDataFiles():model.cc:248) Loading i-vector extractor from C:\Users\selcu\source\repos\VoiceCommand\VoiceCommand\bin\Debug\net10.0\model/ivector/final.ie
+    LOG (VoskAPI:ComputeDerivedVars():ivector-extractor.cc:183) Computing derived variables for iVector extractor
+    LOG (VoskAPI:ComputeDerivedVars():ivector-extractor.cc:204) Done.
+    LOG (VoskAPI:ReadDataFiles():model.cc:282) Loading HCL and G from C:\Users\selcu\source\repos\VoiceCommand\VoiceCommand\bin\Debug\net10.0\model/HCLr.fst C:\Users\selcu\source\repos\VoiceCommand\VoiceCommand\bin\Debug\net10.0\model/Gr.fst
+    LOG (VoskAPI:ReadDataFiles():model.cc:303) Loading winfo C:\Users\selcu\source\repos\VoiceCommand\VoiceCommand\bin\Debug\net10.0\model/word_boundary.int
+    Algılanabilecek komutlar: başla, başlat, kapa, kapat, yazdır, iptal, yeniden dene, kart ver, para yükle, bakiye kontrol
+    Detect-only: listening. Press Ctrl+C to stop.
+    başla
+    başlat
+    kapa
+    kapat
+    yazdır
+    iptal
+    iptal
+    iptal
+    iptal
+    yeniden dene
+    kart ver
+    para yükle
+    bakiye kontrol
+    Stopping detect-only...
+     */
+    // DetectOnly: listen and print only the detected canonical command (one per final result).
+    public static void DetectOnly()
+    {
+        Console.WriteLine("Starting detect-only session (prints only detected commands)...");
+        var modelPath = Path.Combine(AppContext.BaseDirectory, "model");
+        if (!Directory.Exists(modelPath))
+        {
+            Console.WriteLine($"Model folder not found: {modelPath}");
+            return;
+        }
+
+        try
+        {
+            Vosk.Vosk.SetLogLevel(0);
+            using var model = new Model(modelPath);
+            using var recognizer = new VoskRecognizer(model, 16000.0f);
+
+            using var waveIn = new WaveInEvent
+            {
+                DeviceNumber = 0,
+                WaveFormat = new WaveFormat(16000, 16, 1)
+            };
+
+            waveIn.DataAvailable += (s, e) =>
+            {
+                try
+                {
+                    // AcceptWaveform returns true when recognizer has a final result available
+                    var accepted = recognizer.AcceptWaveform(e.Buffer, e.BytesRecorded);
+                    string json = accepted ? recognizer.Result() : recognizer.PartialResult();
+
+                    // Extract words (handles 'result', 'text' or 'partial') and normalize
+                    var words = ExtractWordsFromResult(json);
+                    if (words.Length == 0) return;
+
+                    var normalizedText = string.Join(' ', words);
+
+                    // Exact normalized string comparison against canonical commands
+                    foreach (var cmd in Commands)
+                    {
+                        if (CleanToken(cmd) == normalizedText)
+                        {
+                            lock (_printLock)
+                            {
+                                var now = DateTime.UtcNow;
+                                if (cmd != _lastPrintedCommand || (now - _lastPrintedTime).TotalMilliseconds > RepeatSuppressMs)
+                                {
+                                    Console.WriteLine(cmd);
+                                    _lastPrintedCommand = cmd;
+                                    _lastPrintedTime = now;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"DetectOnly DataAvailable error: {ex}");
+                }
+            };
+
+            Console.WriteLine("Algılanabilecek komutlar: " + string.Join(", ", Commands));
+            Console.WriteLine("Detect-only: listening. Press Ctrl+C to stop.");
+            Console.CancelKeyPress += (s, e) =>
+            {
+                e.Cancel = true;
+                Console.WriteLine("Stopping detect-only...");
+                _stopping = true; // signal handler to stop processing
+                waveIn.StopRecording();
+                // wait for RecordingStopped to ensure no more DataAvailable callbacks
+                _recordingStopped.Wait(2000);
+                StopEvent.Set();
+            };
+
+            StopEvent.Reset();
+            waveIn.StartRecording();
+            StopEvent.Wait();
+            // ensure recording stopped and callbacks finished
+            _stopping = true;
+            waveIn.StopRecording();
+            _recordingStopped.Wait(2000);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"DetectOnly error: {ex}");
         }
     }
 

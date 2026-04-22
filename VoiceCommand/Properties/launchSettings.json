@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "VoiceCommand": {
+      "commandName": "Project",
+      "commandLineArgs": "detect"
+    }
+  }
+}
