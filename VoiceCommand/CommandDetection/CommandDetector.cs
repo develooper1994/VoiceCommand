@@ -1,10 +1,6 @@
-using System;
-using System.IO;
 using System.Text.Json;
-using System.Collections.Generic;
 using Vosk;
 using NAudio.Wave;
-using NAudio.MediaFoundation;
 
 namespace VoiceCommand.CommandDetection
 {
@@ -157,7 +153,7 @@ namespace VoiceCommand.CommandDetection
         public static string TranscribeFile(string modelDir, string wavPath)
         {
             if (!System.IO.File.Exists(wavPath)) throw new System.IO.FileNotFoundException("Audio file not found", wavPath);
-            using var model = new Model(modelDir);
+            using var model = new Vosk.Model(modelDir);
             using var recognizer = new VoskRecognizer(model, 16000.0f);
 
             using var reader = new NAudio.Wave.WaveFileReader(wavPath);
@@ -176,7 +172,7 @@ namespace VoiceCommand.CommandDetection
 
             var buffer = new byte[4096];
             int read;
-            string lastJson = null;
+            string? lastJson = null;
             while ((read = waveProvider.Read(buffer, 0, buffer.Length)) > 0)
             {
                 if (recognizer.AcceptWaveform(buffer, read))

@@ -17,25 +17,33 @@ Lightweight Türkçe sesli komut algılama örneği. Proje, komut eşleştirme m
 
 1. Bağımlılıkları yükleyin ve derleyin:
 
-   dotnet restore
-   dotnet build
+    dotnet restore
+    dotnet build
 
-2. Vosk Türkçe modelini indirin ve uygulama çalışma dizininde `model/` klasörüne koyun.
-   - Örnek model: https://alphacephei.com/vosk/models/vosk-model-small-tr-0.3.zip
-   - Zip'i açtıktan sonra içindeki klasörün içeriğini doğrudan `model/` altına kopyalayın.
+2. Modeller
 
-Çalıştırma:
+    - Manuel: Vosk modelleri: https://alphacephei.com/vosk/models
+       - Örnek model: `vosk-model-small-tr-0.3.zip`
+       - Zip'i açtıktan sonra içindeki klasörün içeriğini doğrudan `model/vosk/<modelname>/` altına kopyalayın.
+    - Otomatik: Uygulama, eksik modelleri indirmek için `--download-models` veya `--auto-install` argümanını destekler. Bu işlem büyük dosyalar indirebilir; internet bağlantısı gerektirir.
+    - Otomatik: Uygulama, eksik modelleri indirmek için `--download-models`, `--auto-install` veya `--autoinstall` argümanlarını destekler. Bu işlem büyük dosyalar indirebilir; internet bağlantısı gerektirir.
+    - Whisper için model boyutu seçeneği: `--model-size <tiny|base|small|medium|large>` kullanılabilir veya `--model-url <url>` ile doğrudan URL verilebilir.
 
-- Normal: dotnet run --project VoiceCommand
-- Detect-only modu (sadece eşleşen kanonik komutları yazar): dotnet run --project VoiceCommand -- detect
-- Full mod (tüm algılanan kelimeleri gösterir): dotnet run --project VoiceCommand -- full
+Çalıştırma ve örnekler:
+
+- Yardım: `dotnet run --project VoiceCommand -- --help`
+- Detect-only modu (sadece eşleşen kanonik komutları yazar):
+   `dotnet run --project VoiceCommand -- detect`
+- Full mod (tüm algılanan kelimeleri gösterir):
+   `dotnet run --project VoiceCommand -- full`
+- Otomatik model indirme (örnek):
+   `dotnet run --project VoiceCommand -- --download-models --model vosk`
+   veya
+   `dotnet run --project VoiceCommand -- --auto-install --model whisper --model-url <direct-model-url>`
 
 ## Whisper.net denemesi
 
-Projeye deneysel olarak `Whisper.net` paketi eklendi. Varsayılan olarak uygulama hâlâ Vosk kullanır. Whisper ile denemek için:
-
-1. Whisper modellerini (ve kullanım talimatlarını) Whisper.net belgelendirmesinden edinin.
-2. Yeni bir backend uygulaması yazıp CommandDetection modülünü yeniden kullanın.
+Projeye deneysel olarak `Whisper.net` paketi eklendi. Varsayılan olarak uygulama hâlâ Vosk kullanır. Whisper ile denemek için yönergeler ve manuel kurulum adımları için [docs/ModelInstall.md](docs/ModelInstall.md) dosyasına bakın.
 
 ## Bağımlılıklar
 

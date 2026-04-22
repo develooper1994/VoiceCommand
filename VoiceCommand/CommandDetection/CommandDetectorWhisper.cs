@@ -1,9 +1,10 @@
 using System;
-using System.Collections.Generic;
-using System.Text.Json;
 using System.IO;
-using System.Threading.Tasks;
+using System.Text.Json;
 using NAudio.Wave;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Diagnostics;
 
 // Minimal Whisper-backed command detector skeleton. Mirrors the Vosk detector API
 // so it can be swapped in for comparison. This implementation does not yet call
@@ -27,6 +28,78 @@ namespace VoiceCommand.CommandDetection
                 if (char.IsLetter(ch) || char.IsWhiteSpace(ch)) sb.Append(ch);
             }
             return sb.ToString().Trim().ToLowerInvariant();
+        }
+
+        public static async System.Threading.Tasks.Task TranscribeFileStreamAsync(string modelDir, string wavPath, Action<string> onSegment)
+        {
+            if (!System.IO.File.Exists(wavPath)) throw new System.IO.FileNotFoundException("Audio file not found", wavPath);
+
+            var modelFiles = System.IO.Directory.GetFiles(modelDir, "*.bin");
+            if (modelFiles.Length == 0) modelFiles = System.IO.Directory.GetFiles(modelDir, "*.ggml*");
+            if (modelFiles.Length == 0) throw new System.IO.FileNotFoundException("No Whisper ggml model file found in " + modelDir);
+            var modelPath = modelFiles[0];
+
+            try
+            {
+                var fi = new FileInfo(modelPath);
+                var factory = GetOrCreateFactory(modelPath);
+                Interlocked.Increment(ref _activeProcessorCount);
+                try
+                {
+                    using var processor = factory.CreateBuilder()
+                        .WithLanguage("tr")
+                        .Build();
+
+                    using var fs = System.IO.File.OpenRead(wavPath);
+                    await foreach (var result in processor.ProcessAsync(fs))
+                    {
+                        if (!string.IsNullOrWhiteSpace(result.Text))
+                        {
+                            try
+                            {
+                                onSegment?.Invoke(result.Text);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"onSegment callback error: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _activeProcessorCount);
+                }
+            }
+            catch (Exception ex)
+            {
+                var msg = ex.Message ?? string.Empty;
+                Console.WriteLine($"Whisper transcribe stream error: {msg}");
+                if (!_nativeRuntimeProblemReported && (ex is DllNotFoundException || msg.Contains("Native Library not found", StringComparison.OrdinalIgnoreCase) || msg.Contains("could not load", StringComparison.OrdinalIgnoreCase) || msg.Contains("BadImageFormatException", StringComparison.OrdinalIgnoreCase)))
+                {
+                    _nativeRuntimeProblemReported = true;
+                    Console.WriteLine();
+                    Console.WriteLine("Whisper native runtime/library not found or not loadable.");
+                    Console.WriteLine("Recommended fixes:");
+                    Console.WriteLine("  - Add the official native runtime package to the project: \"dotnet add package Whisper.net.Runtime\"");
+                    Console.WriteLine("    NuGet: https://www.nuget.org/packages/Whisper.net.Runtime");
+                    Console.WriteLine("  - Or install the native whisper.cpp libraries for your platform and ensure they are discoverable at runtime.");
+                    Console.WriteLine("    Repo: https://github.com/ggerganov/whisper.cpp");
+                    Console.WriteLine("  - Ensure the native library architecture (x64/x86/arm) matches your .NET runtime architecture.");
+                    try
+                    {
+                        Console.WriteLine($"    Process is 64-bit: {Environment.Is64BitProcess}");
+                        Console.WriteLine($"    OS Arch: {RuntimeInformation.OSArchitecture}");
+                        Console.WriteLine($"    Process Arch: {RuntimeInformation.ProcessArchitecture}");
+                    }
+                    catch { }
+                    Console.WriteLine();
+                    Console.WriteLine("After installing the runtime, re-run the app. Realtime transcription will be stopped to avoid repeated errors.");
+                    try { StopRealtimeTranscription(); } catch { }
+                }
+
+                return;
+            }
         }
 
         // For parity with Vosk JSON helpers, provide the same signature. Whisper
@@ -66,16 +139,86 @@ namespace VoiceCommand.CommandDetection
         }
 
         // --- Real-time (chunked) microphone transcription helpers ---
-        private static WaveInEvent _waveInRealtime;
-        private static MemoryStream _bufferRealtime;
+        private static WaveInEvent? _waveInRealtime;
+        private static MemoryStream? _bufferRealtime;
         private static readonly object _bufferLock = new object();
         private static int _bytesPerChunk = 16000 * 2; // default 1s worth (will be overwritten)
         private static bool _realtimeRunning = false;
+            // Whether we've already reported a native runtime/library problem to avoid spamming
+            private static bool _nativeRuntimeProblemReported = false;
+
+            // Cached Whisper factory and synchronization primitives to avoid recreating the heavy model per chunk.
+            private static Whisper.net.WhisperFactory? _cachedFactory;
+            private static readonly object _factoryLock = new();
+            // Count of active processors (created from the cached factory) to allow graceful disposal.
+            private static int _activeProcessorCount = 0;
+
+            // Validate that a plausible ggml model file exists in the specified directory.
+            // Returns true and the resolved model path when the file appears acceptable.
+            private static bool TryGetValidModelPath(string modelDir, out string? modelPath, long minSizeBytes = 1 * 1024 * 1024)
+            {
+                modelPath = null;
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(modelDir) || !Directory.Exists(modelDir))
+                    {
+                        Console.WriteLine($"Whisper model directory not found: {modelDir}");
+                        return false;
+                    }
+
+                    var modelFiles = Directory.GetFiles(modelDir, "*.bin");
+                    if (modelFiles.Length == 0) modelFiles = Directory.GetFiles(modelDir, "*.ggml*");
+                    if (modelFiles.Length == 0)
+                    {
+                        Console.WriteLine($"No Whisper ggml model file found in {modelDir}");
+                        return false;
+                    }
+
+                    var candidate = modelFiles[0];
+                    var fi = new FileInfo(candidate);
+                    Console.WriteLine($"Whisper model candidate: {candidate} ({fi.Length} bytes)");
+                    if (fi.Length < minSizeBytes)
+                    {
+                        Console.WriteLine($"Whisper model file appears too small ({fi.Length} bytes). Try re-downloading with '--force'.");
+                        return false;
+                    }
+
+                    modelPath = candidate;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error while validating Whisper model: {ex.Message}");
+                    return false;
+                }
+            }
+
+            // Helper: create or return a cached WhisperFactory for the provided model path.
+            private static Whisper.net.WhisperFactory GetOrCreateFactory(string modelPath)
+            {
+                lock (_factoryLock)
+                {
+                    if (_cachedFactory != null) return _cachedFactory;
+                    var start = DateTime.UtcNow;
+                    _cachedFactory = Whisper.net.WhisperFactory.FromPath(modelPath);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Whisper factory created and cached (took {(DateTime.UtcNow - start).TotalSeconds:F2}s)");
+                    return _cachedFactory;
+                }
+            }
 
         // Start real-time (chunked) transcription. onTranscribed is invoked when each chunk is processed.
         public static void StartRealtimeTranscription(string modelDir, Action<string> onTranscribed, int chunkMs = 1000, int deviceNumber = 0)
         {
             if (_realtimeRunning) return;
+
+            // quick validation to avoid starting realtime when the model is missing
+            // or appears to be a partial/corrupt download (prevents native ggml asserts)
+            if (!TryGetValidModelPath(modelDir, out var _))
+            {
+                Console.WriteLine("Aborting realtime transcription due to invalid/absent Whisper model.");
+                return;
+            }
+
             _realtimeRunning = true;
             _bufferRealtime = new MemoryStream();
             // bytes per millisecond = sampleRate * channels * bytesPerSample / 1000 = 16000*1*2/1000 = 32
@@ -161,6 +304,21 @@ namespace VoiceCommand.CommandDetection
                 _bufferRealtime = null;
             }
             _realtimeRunning = false;
+
+            // Dispose cached factory after allowing in-flight processors to finish (short timeout).
+            lock (_factoryLock)
+            {
+                if (_cachedFactory != null)
+                {
+                    var sw = Stopwatch.StartNew();
+                    while (Volatile.Read(ref _activeProcessorCount) > 0 && sw.Elapsed.TotalSeconds < 5)
+                    {
+                        Thread.Sleep(50);
+                    }
+                    try { _cachedFactory.Dispose(); } catch { }
+                    _cachedFactory = null;
+                }
+            }
         }
 
         // Transcribe a WAV file using Whisper.net offline GGML model located in modelDir.
@@ -175,34 +333,74 @@ namespace VoiceCommand.CommandDetection
             if (modelFiles.Length == 0) throw new System.IO.FileNotFoundException("No Whisper ggml model file found in " + modelDir);
             var modelPath = modelFiles[0];
 
-            // Use Whisper.net factory to create processor
+            // Use Whisper.net factory to create processor. Log the chosen model path and size
             try
             {
-                // WhisperFactory is in the Whisper namespace (Whisper.net package)
-                // ensure the Whisper.net runtime package is referenced in the project
-                using var factory = Whisper.net.WhisperFactory.FromPath(modelPath);
-                using var processor = factory.CreateBuilder()
-                    .WithLanguage("tr")
-                    .Build();
+                var fi = new FileInfo(modelPath);
+                var startLoad = DateTime.UtcNow;
 
-                using var fs = System.IO.File.OpenRead(wavPath);
-                var sb = new System.Text.StringBuilder();
-                await foreach (var result in processor.ProcessAsync(fs))
+                var factory = GetOrCreateFactory(modelPath);
+                Interlocked.Increment(ref _activeProcessorCount);
+                try
                 {
-                    if (!string.IsNullOrWhiteSpace(result.Text))
+                    var startBuild = DateTime.UtcNow;
+                    using var processor = factory.CreateBuilder()
+                        .WithLanguage("tr")
+                        .Build();
+                    var afterBuild = DateTime.UtcNow;
+                    var buildSeconds = (afterBuild - startBuild).TotalSeconds;
+                    if (buildSeconds > 0.05)
                     {
-                        sb.Append(result.Text);
-                        sb.Append(' ');
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Whisper processor built (took {buildSeconds:F2}s)");
                     }
-                }
 
-                var text = sb.ToString().Trim();
-                return text;
+                    using var fs = System.IO.File.OpenRead(wavPath);
+                    var sb = new System.Text.StringBuilder();
+                    await foreach (var result in processor.ProcessAsync(fs))
+                    {
+                        if (!string.IsNullOrWhiteSpace(result.Text))
+                        {
+                            sb.Append(result.Text);
+                            sb.Append(' ');
+                        }
+                    }
+
+                    var text = sb.ToString().Trim();
+                    return text;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _activeProcessorCount);
+                }
             }
             catch (Exception ex)
             {
-                // surface the error as empty result
-                Console.WriteLine($"Whisper transcribe error: {ex.Message}");
+                // Detect common native runtime errors and print actionable instructions once
+                var msg = ex.Message ?? string.Empty;
+                Console.WriteLine($"Whisper transcribe error: {msg}");
+                if (!_nativeRuntimeProblemReported && (ex is DllNotFoundException || msg.Contains("Native Library not found", StringComparison.OrdinalIgnoreCase) || msg.Contains("could not load", StringComparison.OrdinalIgnoreCase) || msg.Contains("BadImageFormatException", StringComparison.OrdinalIgnoreCase)))
+                {
+                    _nativeRuntimeProblemReported = true;
+                    Console.WriteLine();
+                    Console.WriteLine("Whisper native runtime/library not found or not loadable.");
+                    Console.WriteLine("Recommended fixes:");
+                    Console.WriteLine("  - Add the official native runtime package to the project: \"dotnet add package Whisper.net.Runtime\"");
+                    Console.WriteLine("    NuGet: https://www.nuget.org/packages/Whisper.net.Runtime");
+                    Console.WriteLine("  - Or install the native whisper.cpp libraries for your platform and ensure they are discoverable at runtime.");
+                    Console.WriteLine("    Repo: https://github.com/ggerganov/whisper.cpp");
+                    Console.WriteLine("  - Ensure the native library architecture (x64/x86/arm) matches your .NET runtime architecture.");
+                    try
+                    {
+                        Console.WriteLine($"    Process is 64-bit: {Environment.Is64BitProcess}");
+                        Console.WriteLine($"    OS Arch: {RuntimeInformation.OSArchitecture}");
+                        Console.WriteLine($"    Process Arch: {RuntimeInformation.ProcessArchitecture}");
+                    }
+                    catch { }
+                    Console.WriteLine();
+                    Console.WriteLine("After installing the runtime, re-run the app. Realtime transcription will be stopped to avoid repeated errors.");
+                    try { StopRealtimeTranscription(); } catch { }
+                }
+
                 return string.Empty;
             }
         }
