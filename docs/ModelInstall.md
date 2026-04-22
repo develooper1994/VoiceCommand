@@ -114,24 +114,25 @@ Steps to enable GPU acceleration:
   - Build whisper.cpp with CUDA support by following the project's build instructions and enabling CUDA backend. See: https://github.com/ggerganov/whisper.cpp
   - Alternatively, build with Vulkan/WGPU support if CUDA is not available.
 
-2. Place the resulting native DLLs/shared objects in a folder, e.g. `C:\whisper_native_gpu\`.
+2. Place the resulting native DLLs/shared objects in a folder, e.g. `C:\whisper_native_gpu\` (optional if you installed a runtime package).
 
-3. Run the app with the `--whisper-native-path` option pointing to that folder and request acceleration with `--whisper-accel`:
+3. The application supports a `--runtime` option and automatic detection of Whisper.net runtime assemblies. It looks for `Whisper.net.Runtime.*` assemblies in the application output (for example `Whisper.net.Runtime.Cuda.dll` or `Whisper.net.Runtime.Vulkan.dll`). If a GPU-enabled runtime assembly is present, the app will attempt to load it and use GPU acceleration.
+
+Example (auto-detect preferred runtime):
 
 ```powershell
-dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --whisper-native-path "C:\whisper_native_gpu" --whisper-accel cuda
+dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --runtime auto
+```
+
+Force a specific runtime:
+
+```powershell
+dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --runtime cuda
 ```
 
 Notes:
-- The application will prepend the provided path to the process `PATH` environment variable before loading Whisper, which allows the native loader to find your GPU-enabled libraries.
-- The `--whisper-accel` flag sets an environment variable `WHISPER_ACCEL` for the process to signal intent; native runtimes or helper scripts may read this to choose GPU code paths.
-- You must ensure CUDA drivers and runtime libraries compatible with your native build are installed on the machine.
-- If GPU-enabled native libraries are not present or incompatible, the app will fall back to CPU/ggml behavior (or fail with a native load error). See troubleshooting below.
-
-Auto-detection:
-
-- If you do not specify `--whisper-accel`, the application will attempt to auto-detect available GPU runtimes by looking for common native loader libraries (e.g., `nvcuda.dll` on Windows or `libcuda.so` / `libvulkan.so` on Linux). If CUDA is present it will prefer `cuda`, otherwise it will try `vulkan`.
-- Auto-detection only verifies presence of the system GPU runtime loader; you still need a GPU-enabled `whisper.cpp` native build (DLLs/so files) to actually perform GPU inference. Use `--whisper-native-path` to point to those native binaries.
+- To actually enable GPU inference you must have both system GPU drivers/runtime (CUDA/Vulkan) installed and a GPU-enabled `Whisper.net` runtime assembly present in the app output (install the appropriate NuGet runtime package or copy the assembly/DLLs into the output folder).
+- If the requested runtime assembly is not found or fails to load, the app will fall back to CPU (ggml) behavior and print a warning.
 
 ## Troubleshooting
 

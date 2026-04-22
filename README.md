@@ -42,18 +42,19 @@ Lightweight Türkçe sesli komut algılama örneği. Proje, komut eşleştirme m
 
 GPU acceleration (experimental)
 
-The app can attempt to use a GPU-enabled native Whisper runtime (CUDA or Vulkan) if you provide one. This requires building or obtaining a GPU-enabled `whisper.cpp` native library and pointing the app at the folder containing its DLLs.
+The app can attempt to use a GPU-enabled Whisper runtime (CUDA or Vulkan) if you have a GPU-enabled `Whisper.net` runtime assembly present (for example `Whisper.net.Runtime.Cuda.dll` or `Whisper.net.Runtime.Vulkan.dll` in the application output). By default the app will auto-detect available runtime assemblies and load the best one; you can force a runtime with `--runtime`.
 
-Usage example:
+Usage example (auto-detect):
 
 ```powershell
-dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --whisper-native-path "C:\whisper_native_gpu" --whisper-accel cuda
+dotnet run --project VoiceCommand -- partial --backend whisper --input mic --model-size base --runtime auto
 ```
 
+To force a specific runtime use `--runtime cuda`, `--runtime vulkan`, or `--runtime cpu`.
+
 Notes:
-- The `--whisper-native-path` directory is prepended to the process `PATH` so the native loader can find GPU-enabled libraries.
-- The `--whisper-accel` option is advisory (values: `auto`, `cpu`, `cuda`, `vulkan`) and sets `WHISPER_ACCEL` environment variable for native runtimes to pick up.
-- You must ensure appropriate GPU drivers and CUDA/Vulkan runtimes are installed. See `docs/ModelInstall.md` for more details.
+- The application will look for `Whisper.net.Runtime.*` assemblies in the app output directory and attempt to load them. Installing the appropriate NuGet runtime package (e.g., `Whisper.net.Runtime.Cuda`) or copying its assemblies into the output folder is required to actually enable GPU inference.
+- You must ensure appropriate GPU drivers and CUDA/Vulkan runtimes are installed on the host.
 
    - CMD örnek:
 

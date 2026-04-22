@@ -1,9 +1,8 @@
 ﻿using NAudio.Wave;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using Vosk;
 using VoiceCommand.CommandDetection;
-using System.Threading.Tasks;
-using VoiceCommand.Model;
 
 class Program
 {
@@ -40,9 +39,8 @@ class Program
         var backendSpecified = false;
         var modelUrlSpecified = false;
         var modelSizeSpecified = false;
-        string? whisperNativePath = null;
-        var whisperAccel = "auto"; // values: auto, cpu, cuda, vulkan
-        var whisperAccelSpecified = false;
+        var runtimeArg = "auto"; // values: auto, cpu, cuda, vulkan
+        var runtimeArgSpecified = false;
 
         if (args == null || args.Length == 0)
         {
@@ -118,14 +116,10 @@ class Program
                 {
                     modelDirOverride = args[++i];
                 }
-                else if (a.Equals("--whisper-native-path", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                else if (a.Equals("--runtime", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 {
-                    whisperNativePath = args[++i];
-                }
-                else if (a.Equals("--whisper-accel", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-                {
-                    whisperAccel = args[++i];
-                    whisperAccelSpecified = true;
+                    runtimeArg = args[++i];
+                    runtimeArgSpecified = true;
                 }
                 else if (a.Equals("--list-models", StringComparison.OrdinalIgnoreCase))
                 {
@@ -271,38 +265,93 @@ class Program
         return null;
     }
 
-    // Auto-detect available GPU accel libraries (CUDA / Vulkan) on the host.
-    static string? AutoDetectWhisperAccel()
+    // Detect a Whisper.net runtime assembly present in the application output and return its runtime id (cpu|cuda|vulkan) or null.
+    static string? DetectWhisperRuntimeAssembly()
     {
         try
         {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            var baseDir = AppContext.BaseDirectory;
+            if (!Directory.Exists(baseDir)) return null;
+
+            var files = Directory.GetFiles(baseDir, "Whisper.net.Runtime*.dll", SearchOption.TopDirectoryOnly);
+            // Prefer CUDA runtime if present
+            foreach (var f in files)
             {
-                if (TryLoadNativeLibrary("nvcuda.dll")) return "cuda";
-                if (TryLoadNativeLibrary("vulkan-1.dll")) return "vulkan";
+                var n = Path.GetFileName(f).ToLowerInvariant();
+                if (n.Contains("cuda")) return "cuda";
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            // Then Vulkan
+            foreach (var f in files)
             {
-                if (TryLoadNativeLibrary("libcuda.so.1") || TryLoadNativeLibrary("libcuda.so")) return "cuda";
-                if (TryLoadNativeLibrary("libvulkan.so.1") || TryLoadNativeLibrary("libvulkan.so")) return "vulkan";
+                var n = Path.GetFileName(f).ToLowerInvariant();
+                if (n.Contains("vulkan")) return "vulkan";
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            // Finally CPU runtime package
+            foreach (var f in files)
             {
-                if (TryLoadNativeLibrary("libvulkan.1.dylib") || TryLoadNativeLibrary("libvulkan.dylib")) return "vulkan";
+                var n = Path.GetFileName(f).ToLowerInvariant();
+                if (n.Contains("whisper.net.runtime") && !n.Contains("cuda") && !n.Contains("vulkan")) return "cpu";
             }
         }
         catch { }
         return null;
     }
 
-    static bool TryLoadNativeLibrary(string name)
+    // Try to load the runtime assembly for the given runtime id. Returns true if assembly load succeeded or was already loaded.
+    static bool TryLoadWhisperRuntimeAssembly(string runtime)
     {
         try
         {
-            if (NativeLibrary.TryLoad(name, out var handle))
+            // If already loaded, return true
+            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
             {
-                try { NativeLibrary.Free(handle); } catch { }
-                return true;
+                try
+                {
+                    if (string.Equals(a.GetName().Name, runtime.Equals("cpu", StringComparison.OrdinalIgnoreCase) ? "Whisper.net.Runtime" : $"Whisper.net.Runtime.{runtime}", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                catch { }
+            }
+
+            var baseDir = AppContext.BaseDirectory;
+            if (!Directory.Exists(baseDir)) return false;
+
+            // Candidate filenames to try
+            var candidates = new List<string>();
+            if (runtime.Equals("cpu", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add("Whisper.net.Runtime.dll");
+                // also accept any runtime dll that doesn't explicitly contain cuda/vulkan
+                candidates.AddRange(Directory.GetFiles(baseDir, "Whisper.net.Runtime*.dll", SearchOption.TopDirectoryOnly)
+                                    .Where(p => !Path.GetFileName(p).ToLowerInvariant().Contains("cuda") && !Path.GetFileName(p).ToLowerInvariant().Contains("vulkan")));
+            }
+            else if (runtime.Equals("cuda", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add("Whisper.net.Runtime.Cuda.dll");
+                candidates.AddRange(Directory.GetFiles(baseDir, "Whisper.net.Runtime*.dll", SearchOption.TopDirectoryOnly)
+                                    .Where(p => Path.GetFileName(p).ToLowerInvariant().Contains("cuda")));
+            }
+            else if (runtime.Equals("vulkan", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add("Whisper.net.Runtime.Vulkan.dll");
+                candidates.AddRange(Directory.GetFiles(baseDir, "Whisper.net.Runtime*.dll", SearchOption.TopDirectoryOnly)
+                                    .Where(p => Path.GetFileName(p).ToLowerInvariant().Contains("vulkan")));
+            }
+
+            // Try to load any candidate
+            foreach (var c in candidates)
+            {
+                var path = Path.IsPathRooted(c) ? c : Path.Combine(baseDir, c);
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    Assembly.LoadFrom(path);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to load runtime assembly '{path}': {ex.Message}");
+                }
             }
         }
         catch { }
@@ -404,62 +453,51 @@ class Program
         {
             Console.WriteLine("Model missing or absent: automatic install will be attempted because a run command was specified.");
         }
-        // If the user provided a custom native runtime path for Whisper (e.g., GPU-enabled whisper.cpp builds),
-        // prepend it to PATH so native loader can find the GPU-enabled native libraries before the default ones.
-        if (!string.IsNullOrEmpty(whisperNativePath))
+        // Determine requested runtime (auto|cpu|cuda|vulkan) and attempt to load the corresponding Whisper.net runtime assembly
+        string selectedRuntime;
+        if (!runtimeArgSpecified || runtimeArg.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
-            try
+            var detected = DetectWhisperRuntimeAssembly();
+            if (!string.IsNullOrEmpty(detected))
             {
-                var abs = Path.GetFullPath(whisperNativePath);
-                if (Directory.Exists(abs))
+                if (TryLoadWhisperRuntimeAssembly(detected))
                 {
-                    var old = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-                    var sep = Path.PathSeparator;
-                    Environment.SetEnvironmentVariable("PATH", abs + sep + old);
-                    Console.WriteLine($"Added '{abs}' to PATH for native Whisper libraries.");
+                    selectedRuntime = detected;
+                    Console.WriteLine($"Auto-detected and loaded Whisper runtime assembly: {selectedRuntime}");
                 }
                 else
                 {
-                    Console.WriteLine($"Whisper native path not found: {abs}");
+                    Console.WriteLine($"Auto-detected runtime '{detected}' but failed to load its assembly. Falling back to CPU.");
+                    selectedRuntime = "cpu";
                 }
             }
-            catch (Exception ex)
+            else
             {
-                Console.WriteLine($"Failed to adjust PATH for native Whisper libs: {ex.Message}");
+                Console.WriteLine("No Whisper runtime assembly found; using CPU (Whisper.net.Runtime if present).");
+                selectedRuntime = "cpu";
             }
         }
-
-        // If user requested an acceleration backend (e.g., 'cuda' or 'vulkan'), expose it as an environment variable
-        // so native runtimes or helper scripts can pick it up. This is advisory; user must install/compile GPU-enabled native libs.
-        try
+        else
         {
-            // If user didn't explicitly pick accel (or used 'auto'), try to detect installed GPU runtimes
-            if (!whisperAccelSpecified || whisperAccel.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            selectedRuntime = runtimeArg.ToLowerInvariant();
+            if (selectedRuntime != "cpu")
             {
-                try
+                if (TryLoadWhisperRuntimeAssembly(selectedRuntime))
                 {
-                    var detected = AutoDetectWhisperAccel();
-                    if (!string.IsNullOrEmpty(detected))
-                    {
-                        whisperAccel = detected;
-                        Console.WriteLine($"Auto-detected Whisper acceleration: {whisperAccel}");
-                    }
-                    else
-                    {
-                        whisperAccel = "cpu";
-                        Console.WriteLine("No GPU acceleration detected; falling back to CPU (ggml).");
-                    }
+                    Console.WriteLine($"Loaded requested Whisper runtime assembly: {selectedRuntime}");
                 }
-                catch { }
+                else
+                {
+                    Console.WriteLine($"Requested runtime '{selectedRuntime}' not found or failed to load; falling back to CPU.");
+                    selectedRuntime = "cpu";
+                }
             }
-
-            if (!string.IsNullOrEmpty(whisperAccel) && !whisperAccel.Equals("cpu", StringComparison.OrdinalIgnoreCase) && !whisperAccel.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            else
             {
-                Environment.SetEnvironmentVariable("WHISPER_ACCEL", whisperAccel);
-                Console.WriteLine($"Requested Whisper acceleration: {whisperAccel} (set WHISPER_ACCEL env var).\nIf you want GPU support, ensure you have a GPU-enabled whisper.cpp native build and place its DLLs in a folder and pass --whisper-native-path <path>.");
+                // try to load CPU runtime if present
+                TryLoadWhisperRuntimeAssembly("cpu");
             }
         }
-        catch { }
 
         var ensured = await VoiceCommand.Model.ModelInstaller.EnsureModelAsync(backend, modelPath, shouldAutoInstall, modelUrl, forceInstall);
         if (!ensured)

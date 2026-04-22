@@ -1,9 +1,6 @@
-using System;
-using System.IO;
 using System.Text.Json;
 using NAudio.Wave;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Diagnostics;
 
 // Minimal Whisper-backed command detector skeleton. Mirrors the Vosk detector API
