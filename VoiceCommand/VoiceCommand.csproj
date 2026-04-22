@@ -12,7 +12,11 @@
   <ItemGroup>
     <PackageReference Include="Vosk" Version="0.3.38" />
     <PackageReference Include="NAudio" Version="2.3.0" />
+    <!-- Whisper.net speech-to-text backend (for experimentation) -->
+    <PackageReference Include="Whisper.net" Version="1.9.0" />
   </ItemGroup>
+
+  <!-- Allow building benchmark project as part of solution if desired -->
 
   <!-- Copy any model files placed in the project 'model' folder to the build output -->
   <ItemGroup>

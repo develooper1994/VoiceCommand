@@ -4,12 +4,13 @@ using System.Text.Json;
 using System.Threading;
 using NAudio.Wave;
 using Vosk;
+using VoiceCommand.CommandDetection;
 
 class Program
 {
     static readonly ManualResetEventSlim StopEvent = new(false);
-    // Shared canonical commands list
-    static readonly string[] Commands = new[] { "başla", "başlat", "kapa", "kapat", "yazdır", "iptal", "yeniden dene", "kart ver", "para yükle", "bakiye kontrol" };
+    // Shared canonical commands list (provided by selected command detection backend)
+    static readonly string[] Commands = VoiceCommand.CommandDetection.CommandDetector.Commands;
     // Prevent printing the same command repeatedly
     static string _lastPrintedCommand = null;
     static DateTime _lastPrintedTime = DateTime.MinValue;
@@ -27,18 +28,51 @@ class Program
 
     static void Main(string[] args)
     {
+        // Parse arguments: allow backend selection and input mode
+        var backendArg = "vosk"; // default
+        var inputMode = "mic"; // mic or file
+        string inputFile = null;
+        if (args != null)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                var a = args[i];
+                if (a.Equals("--backend", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    backendArg = args[i + 1]; i++;
+                }
+                else if (a.Equals("--input", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    inputMode = args[i + 1]; i++;
+                }
+                else if (a.Equals("--file", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    inputFile = args[i + 1]; i++;
+                }
+                else if (a.Equals("full", StringComparison.OrdinalIgnoreCase))
+                {
+                    FullRecognize();
+                    return;
+                }
+                else if (a.Equals("detect", StringComparison.OrdinalIgnoreCase))
+                {
+                    // handled below after backend chosen
+                }
+            }
+        }
+
+        // select backend
+        if (!VoiceCommand.CommandDetection.CommandDetector.TrySetBackend(backendArg))
+        {
+            Console.WriteLine($"Bilinmeyen backend '{backendArg}', varsayılan 'vosk' kullanılacak.");
+            VoiceCommand.CommandDetection.CommandDetector.SetBackend(VoiceCommand.CommandDetection.DetectorBackend.Vosk);
+        }
+
         Console.WriteLine("Sesli komut dinleyici başlatılıyor...");
         // Show possible commands at startup
         Console.WriteLine("Algılanabilecek komutlar: " + string.Join(", ", Commands));
         // Print available audio input devices
         PrintInputDevices();
-
-        // If started with the 'full' argument, run the FullRecognize session and exit.
-        if (args != null && args.Length > 0 && args[0].Equals("full", StringComparison.OrdinalIgnoreCase))
-        {
-            FullRecognize();
-            return;
-        }
 
     static void PrintInputDevices()
     {
@@ -64,18 +98,27 @@ class Program
             return;
         }
 
-        var modelPath = Path.Combine(AppContext.BaseDirectory, "model");
+        // model directory is organized per-backend: model/vosk and model/whisper
+        var baseModelDir = Path.Combine(AppContext.BaseDirectory, "model");
+        var backend = VoiceCommand.CommandDetection.CommandDetector.ActiveBackend;
+        var modelPath = backend == VoiceCommand.CommandDetection.DetectorBackend.Vosk
+            ? Path.Combine(baseModelDir, "vosk")
+            : Path.Combine(baseModelDir, "whisper");
+
         if (!Directory.Exists(modelPath))
         {
             Console.WriteLine($"Model klasörü bulunamadı: {modelPath}");
-            Console.WriteLine("Lütfen Vosk Türkçe modelini indirin ve 'model' klasörüne koyun.");
+            Console.WriteLine("Lütfen uygun backend modelini ilgili klasöre koyun (model/vosk veya model/whisper).");
             return;
         }
 
-        Vosk.Vosk.SetLogLevel(0);
-        // create shared instances and assign to class fields so we can synchronize disposal
-        _modelInstance = new Model(modelPath);
-        _recognizerInstance = new VoskRecognizer(_modelInstance, 16000.0f);
+        if (backend == VoiceCommand.CommandDetection.DetectorBackend.Vosk)
+        {
+            Vosk.Vosk.SetLogLevel(0);
+            // create shared instances and assign to class fields so we can synchronize disposal
+            _modelInstance = new Model(modelPath);
+            _recognizerInstance = new VoskRecognizer(_modelInstance, 16000.0f);
+        }
 
         // No grammar -> recognize free-form (all detected words)
         _waveInInstance = new WaveInEvent
@@ -111,11 +154,11 @@ class Program
                         resultJson = _recognizerInstance.Result();
                     }
                     // Extract only final words (ignore partial fallback) and do not print raw recognized text here
-                    var finalWords = ExtractFinalWords(resultJson);
+                    var finalWords = VoiceCommand.CommandDetection.CommandDetectorVosk.ExtractFinalWords(resultJson);
                     if (finalWords.Length > 0)
                     {
                         // Clean tokens (remove middle dot etc.) and normalize
-                        for (int i = 0; i < finalWords.Length; i++) finalWords[i] = CleanToken(finalWords[i]);
+                        for (int i = 0; i < finalWords.Length; i++) finalWords[i] = VoiceCommand.CommandDetection.CommandDetectorVosk.CleanToken(finalWords[i]);
                         var text = string.Join(' ', finalWords).Trim();
                         var cmd = DetectCommand(text, Commands);
                         if (cmd != null)
@@ -170,113 +213,15 @@ class Program
         try { _waveInInstance?.Dispose(); } catch { }
     }
 
-    // Normalize input for comparison (handle Turkish dotted/dotless I then lowercase invariant)
-    // Clean token: remove punctuation (including interpunct), handle Turkish dotted/dotless I, lowercase invariant
-    static string CleanToken(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return string.Empty;
-        // Replace Turkish dotted/dotless I explicitly before lowercasing
-        s = s.Replace('\u0130', 'i'); // 'İ' -> 'i'
-        s = s.Replace('I', '\u0131'); // 'I' -> 'ı'
-        // Remove common separator characters like middle dot and any non-letter characters
-        var sb = new System.Text.StringBuilder(s.Length);
-        foreach (var ch in s)
-        {
-            if (char.IsLetter(ch) || char.IsWhiteSpace(ch)) sb.Append(ch);
-            // treat middle dot as separator (skip)
-            // other punctuation is removed
-        }
-        return sb.ToString().Trim().ToLowerInvariant();
-    }
-
-    static string[] ExtractWordsFromResult(string json)
-    {
-        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<string>();
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            // If 'result' array present, extract 'word' entries
-            if (root.TryGetProperty("result", out var resultProp) && resultProp.ValueKind == JsonValueKind.Array && resultProp.GetArrayLength() > 0)
-            {
-                var list = new System.Collections.Generic.List<string>();
-                foreach (var item in resultProp.EnumerateArray())
-                {
-                    if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("word", out var w))
-                    {
-                        var word = w.GetString();
-                        if (!string.IsNullOrWhiteSpace(word)) list.Add(CleanToken(word));
-                    }
-                }
-                if (list.Count > 0) return list.ToArray();
-            }
-
-            // Fallback to 'text' property if non-empty
-            if (root.TryGetProperty("text", out var textProp))
-            {
-                var t = textProp.GetString()?.Trim();
-                if (!string.IsNullOrWhiteSpace(t))
-                {
-                    var parts = t.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    for (int i = 0; i < parts.Length; i++) parts[i] = CleanToken(parts[i]);
-                    return parts;
-                }
-            }
-
-            // Partial results
-            if (root.TryGetProperty("partial", out var partialProp))
-            {
-                var p = partialProp.GetString()?.Trim();
-                if (!string.IsNullOrWhiteSpace(p))
-                {
-                    var parts = p.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    for (int i = 0; i < parts.Length; i++) parts[i] = CleanToken(parts[i]);
-                    return parts; // return partial words but caller should ignore if they want finals only
-                }
-            }
-        }
-        catch
-        {
-            // ignore
-        }
-        return Array.Empty<string>();
-    }
-
-    // Extract only final word tokens from a final result JSON (ignore empty 'text' finals)
-    static string[] ExtractFinalWords(string json)
-    {
-        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<string>();
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("result", out var resultProp) && resultProp.ValueKind == JsonValueKind.Array && resultProp.GetArrayLength() > 0)
-            {
-                var list = new System.Collections.Generic.List<string>();
-                foreach (var item in resultProp.EnumerateArray())
-                {
-                    if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("word", out var w))
-                    {
-                        var word = w.GetString();
-                        if (!string.IsNullOrWhiteSpace(word)) list.Add(word);
-                    }
-                }
-                return list.ToArray();
-            }
-        }
-        catch
-        {
-        }
-        return Array.Empty<string>();
-    }
+    // Command detection and text normalization functionality is provided by the
+    // CommandDetection module (CommandDetector class).
 
     static string PrintJsonResult(string kind, string json)
     {
         if (string.IsNullOrWhiteSpace(json)) return null;
         Console.WriteLine($"[{kind}] {json}");
 
-        var words = ExtractWordsFromResult(json);
+        var words = VoiceCommand.CommandDetection.CommandDetectorVosk.ExtractWordsFromResult(json);
         if (words.Length == 0) return null;
         var text = string.Join(' ', words);
         Console.WriteLine($"Recognized text: {text}");
@@ -415,7 +360,7 @@ class Program
                     string json = accepted ? recognizer.Result() : recognizer.PartialResult();
 
                     // Extract words (handles 'result', 'text' or 'partial') and normalize
-                    var words = ExtractWordsFromResult(json);
+                    var words = CommandDetectorVosk.ExtractWordsFromResult(json);
                     if (words.Length == 0) return;
 
                     var normalizedText = string.Join(' ', words);
@@ -423,7 +368,7 @@ class Program
                     // Exact normalized string comparison against canonical commands
                     foreach (var cmd in Commands)
                     {
-                        if (CleanToken(cmd) == normalizedText)
+                        if (CommandDetectorVosk.CleanToken(cmd) == normalizedText)
                         {
                             lock (_printLock)
                             {
