@@ -345,7 +345,9 @@ class Program
                 if (!File.Exists(path)) continue;
                 try
                 {
+#pragma warning disable IL2026
                     Assembly.LoadFrom(path);
+#pragma warning restore IL2026
                     return true;
                 }
                 catch (Exception ex)
@@ -454,6 +456,16 @@ class Program
             Console.WriteLine("Model missing or absent: automatic install will be attempted because a run command was specified.");
         }
         // Determine requested runtime (auto|cpu|cuda|vulkan) and attempt to load the corresponding Whisper.net runtime assembly
+    #if WHISPER_HAS_ALLRUNTIMES
+        // 'all' runtime option is available in builds that include Whisper.net.AllRuntimes
+    #else
+        // If compiled without AllRuntimes, reject explicit use of 'all' early
+        if (runtimeArgSpecified && runtimeArg.Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Error: runtime option 'all' is not available in this build. Rebuild with -p:WhisperEnableAllRuntimes=true to enable it.");
+            return;
+        }
+    #endif
         string selectedRuntime;
         if (!runtimeArgSpecified || runtimeArg.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
@@ -1069,6 +1081,12 @@ class Program
         Console.WriteLine("  --model-url <url>          Direct URL to model archive or file");
         Console.WriteLine("  --model-dir <path>         Override model directory");
         Console.WriteLine("  --force                    Force reinstall even if model present");
+    #if WHISPER_HAS_ALLRUNTIMES
+        Console.WriteLine("  --runtime <auto|cpu|cuda|vulkan|all>  Preferred Whisper runtime (default: auto)");
+        Console.WriteLine("                             Use 'all' to load Whisper.net.AllRuntimes if present.");
+    #else
+        Console.WriteLine("  --runtime <auto|cpu|cuda|vulkan>  Preferred Whisper runtime (default: auto)");
+    #endif
         Console.WriteLine("  -h, --help                 Show this help");
         Console.WriteLine();
         Console.WriteLine("Available models for --model:");

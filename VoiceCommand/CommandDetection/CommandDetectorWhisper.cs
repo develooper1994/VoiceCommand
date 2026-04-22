@@ -38,6 +38,7 @@ namespace VoiceCommand.CommandDetection
 
             try
             {
+                ArgumentNullException.ThrowIfNull(modelPath);
                 var fi = new FileInfo(modelPath);
                 var factory = GetOrCreateFactory(modelPath);
                 Interlocked.Increment(ref _activeProcessorCount);
@@ -174,6 +175,7 @@ namespace VoiceCommand.CommandDetection
                     }
 
                     var candidate = modelFiles[0];
+                    ArgumentNullException.ThrowIfNull(candidate);
                     var fi = new FileInfo(candidate);
                     Console.WriteLine($"Whisper model candidate: {candidate} ({fi.Length} bytes)");
                     if (fi.Length < minSizeBytes)
@@ -195,6 +197,7 @@ namespace VoiceCommand.CommandDetection
             // Helper: create or return a cached WhisperFactory for the provided model path.
             private static Whisper.net.WhisperFactory GetOrCreateFactory(string modelPath)
             {
+                        ArgumentNullException.ThrowIfNull(modelPath);
                         lock (_factoryLock)
                         {
                             if (_cachedFactory != null) return _cachedFactory;
@@ -273,6 +276,7 @@ namespace VoiceCommand.CommandDetection
                 int concurrency = 2;
                 try
                 {
+                    ArgumentNullException.ThrowIfNull(validatedModelPath);
                     var fi = new FileInfo(validatedModelPath);
                     // conservative thresholds
                     if (fi.Length > 400L * 1024 * 1024) concurrency = 1; // >400MB -> 1
@@ -407,6 +411,7 @@ namespace VoiceCommand.CommandDetection
             // Use Whisper.net factory to create processor. Log the chosen model path and size
             try
             {
+                ArgumentNullException.ThrowIfNull(modelPath);
                 var fi = new FileInfo(modelPath);
                 var startLoad = DateTime.UtcNow;
 
